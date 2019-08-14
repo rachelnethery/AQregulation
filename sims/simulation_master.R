@@ -1,0 +1,453 @@
+## Here I have specified the simulation parameters so that
+## reps=1, one dataset will be simulated, increase this to increase the number of simulated datasets
+## N=5000, the sample size of the dataset is 5,000 (sample size corresponds to number of zipcodes)
+## nboot=50, 50 bootstrap samples will be used to produce confidence intervals for the matching estimator
+## simtype=1, the data generating process for simulation 1 as described in Section 4 of the manuscript (simtype=2 and simtype=3 give the DGPs for simulations 2 and 3 in the manuscript)
+## calp=0.1, setting omega=0.1 (omega defines the matching tolerances) as described in Section 4 of the manuscript (calp=0.15 and calp=0.25 are also used to produce simulations in the manuscript)
+
+reps<-1
+N<-5000
+nboot<-50
+simtype<-1
+calp<-0.1
+
+## load required libraries ##
+library(mvtnorm)
+library(dplyr)
+library(splines)
+library(BayesTree)
+
+## load the functions needed to run the matching and bootstrap ##
+source('functions/exmatch_trt_v2.R')
+source('functions/mdmatch_conf_v2.R')
+source('functions/match_rn_app_v2.R')
+source('functions/match_rn_boot5.R')
+
+
+#######################
+## 1. CONSTRUCT DATA ##
+#######################
+
+## seed for data reproducibility and consistency of pollution and confounder data across simulations ##
+set.seed(2)
+
+## simulate 2 factual (observed) pollutants similar to pm2.5 annual average and o3 summer average ##
+Eobs<-rmvnorm(n=N,mean=c(12.18,0.05),sigma=diag(2)*c(7.99,0.0001))
+colnames(Eobs)<-c('pm25','o3')
+## simulate 2 counterfactual pollutants with larger mean and larger spread ##
+Ecf<-Eobs+data.frame(runif(n=N,min=0,max=7.08),runif(n=N,min=0,max=0.03))
+Ecf<-as.matrix(Ecf)
+colnames(Ecf)<-c('pm25','o3')
+
+## simulate confounders ##
+betaE<-matrix(c(runif(n=5,min=-.3,max=.3),12,-5,-3.5,7,-2),nrow=5,byrow=F)
+sdE<-c(0.300000, 1.019467, 3.25, 2.030699, 2.328935)
+X<-rep(1,N)
+for (i in 1:5){
+  confi<-rnorm(n=N,mean=Eobs%*%t(betaE[i,,drop=F]),sd=sdE[i])
+  X<-cbind(X,confi)
+}
+
+## simulate 5 additional predictors of Y that aren't confounders and aren't used in the matching ##
+predonly<-cbind(rnorm(N),rexp(N),runif(N),rnorm(N,sd=2.5))
+betapred<-c(.05,-.02,.076,-.03)
+
+
+## beta values and predictor forms ##
+if (simtype==1){
+  betaconf<-c(0.001400702, -0.024289523,  0.049607745, -0.037199380,  0.023785807,  0.033575231,  0.023112471, -0.034723793)
+  beta<-matrix(c(3,betaconf,.008,.1,.0017,.03,.005,.03,betapred),ncol=1)
+  
+  pform.cf<-cbind(X,X[,2]*X[,3],X[,4]^2,exp(X[,5])/(1+exp(X[,5])),Ecf,Ecf[,1]^2,Ecf[,1]*Ecf[,2],Ecf[,1]*Ecf[,2]*X[,6],Ecf[,1]*Ecf[,2]*X[,5],predonly)
+  pform.obs<-cbind(X,X[,2]*X[,3],X[,4]^2,exp(X[,5])/(1+exp(X[,5])),Eobs,Eobs[,1]^2,Eobs[,1]*Eobs[,2],Eobs[,1]*Eobs[,2]*X[,6],Eobs[,1]*Eobs[,2]*X[,5],predonly)
+  
+} else if (simtype==2){
+  betaconf<-c(0.001400702, -0.024289523,  0.049607745, -0.037199380,  0.023785807,  0.033575231,  0.023112471, -0.034723793)
+  beta<-matrix(c(3,betaconf,.008,.1,.0017,.03,betapred),ncol=1)
+  
+  pform.cf<-cbind(X,X[,2]*X[,3],X[,4]^2,exp(X[,5])/(1+exp(X[,5])),Ecf,Ecf[,1]^2,Ecf[,1]*Ecf[,2],predonly)
+  pform.obs<-cbind(X,X[,2]*X[,3],X[,4]^2,exp(X[,5])/(1+exp(X[,5])),Eobs,Eobs[,1]^2,Eobs[,1]*Eobs[,2],predonly)
+  
+} else if (simtype==3){
+  betaconf<-c(0.001400702, -0.024289523,  0.049607745, -0.037199380,  0.023785807)
+  beta<-matrix(c(3.5,betaconf,.008,.1,betapred),ncol=1)
+  
+  pform.cf<-cbind(X,Ecf,predonly)
+  pform.obs<-cbind(X,Eobs,predonly)
+  
+}
+
+## true causal effect for each unit ##
+ice<-exp(pform.cf%*%beta)-exp(pform.obs%*%beta)
+
+## true TEA for all units (tau) ##
+trueTEAall<-sum(ice)
+
+## omega values, tolerances for exact matching on E ##
+if (calp==1){
+  ecut<-apply(Ecf,2,sd)*.1
+} else if (calp==2){
+  ecut<-apply(Ecf,2,sd)*.15
+} else{
+  ecut<-apply(Ecf,2,sd)*.25
+}
+xx<-matrix(ecut,nrow=nrow(Ecf),ncol=ncol(Ecf),byrow=T)
+
+## caliper for mahalanobis distance matching on confounders ##
+quan<-NULL
+S_inv<-solve(cov(X[,-1]))
+for (j in 1:N){
+  temp<-matrix(rep(X[j,-1],N-1),nrow=N-1,byrow=T)
+  quan<-c(quan,quantile(sqrt(rowSums((temp-X[-j,-1])%*%S_inv*(temp-X[-j,-1]))),.1))
+}
+
+## carry out matching ##
+## the matching function outputs a dataframe with columns
+## trtind: the indices of the units for which we found matches for their counterfactual pollutants and their confounders
+## ctlind: the indices of the matched units for the unit given in the trtind column in the same row
+## note that units for which multiple matches are found will be repeated in the trtind column,
+## with each row having a different ctlind value corresponding to a different matched unit
+orig.matchout.1<-match_rn_app_v2(trtobs=Eobs,trtcf=Ecf,confounders=X[,-1],trtdiff=xx,mdqtl=mean(quan))
+orig.matchind.1<-as.data.frame(orig.matchout.1)
+names(orig.matchind.1)<-c('trtind','ctlind')
+## keep.1 is a vector of the indices of the retained units after trimming
+keep.1<-unique(orig.matchind.1$trtind)
+
+########################
+## 2. RUN SIMULATIONS ##
+########################
+
+## initiate variables to save results for each method ##
+match.1<-NULL
+match.2<-NULL
+match.3<-NULL
+match.4<-NULL
+
+bart.1<-NULL
+
+lm.1<-NULL
+lm.2<-NULL
+lm.3<-NULL
+
+trueTEAretain<-NULL
+
+for (g in 1:reps){
+  ## for each set of simulated data, you want a different seed here in order to obtain different Y values ##
+  set.seed(g-1)
+  
+  ## simulate observed counts of health events, associated with pollutants and confounders ##
+  Yobs<-rpois(n=N,lambda=exp(pform.obs%*%beta))
+  
+  ######################################
+  ## compute matching point estimates ##
+  ######################################
+  
+  ## match.1=no bias correction ##
+  ## impute counterfactuals ##
+  EYcf<-tapply(Yobs[orig.matchind.1$ctlind],orig.matchind.1$trtind,mean)
+  ## difference in imputed counterfactuals and observed number of deaths in each area ## 
+  match.est.1<-sum(EYcf-Yobs[as.numeric(names(EYcf))])
+  
+  ## match.2=linear model bias correction ##
+  regdat<-data.frame(Yobs,Eobs,X[,-1])
+  names(regdat)<-c('y','pm25','o3',paste0('conf',1:5))
+  fit.1<-glm(y~pm25+o3+conf1+conf2+conf3+conf4+conf5, family="poisson", data=regdat)
+  ## for each CF level in matched data, use regression function to predict outcome with true confounders and with confounders of matches ##
+  predXi<-data.frame(Ecf[orig.matchind.1$trtind,],X[orig.matchind.1$trtind,-1])
+  predXj<-data.frame(Ecf[orig.matchind.1$trtind,],X[orig.matchind.1$ctlind,-1])
+  names(predXi)<-c('pm25','o3',paste0('conf',1:5))
+  names(predXj)<-c('pm25','o3',paste0('conf',1:5))
+  ## take difference to be used for bias correction ##
+  diffmeans<-predict(fit.1, predXi, type="response")-predict(fit.1, predXj, type="response")
+  ## impute counterfactuals ##
+  EYcf<-tapply(Yobs[orig.matchind.1$ctlind]+diffmeans,orig.matchind.1$trtind,mean)
+  ## difference in imputed counterfactuals and observed number of deaths in each area ## 
+  match.est.2<-sum(EYcf-Yobs[as.numeric(names(EYcf))])
+  
+  ## match.3=correct model for simtype 2 bias correction ##
+  regdat<-data.frame(Yobs,Eobs,X[,-1],exp(X[,5])/(1+exp(X[,5])))
+  names(regdat)<-c('y','pm25','o3',paste0('conf',1:6))
+  fit.1<-glm(y~pm25+o3+I(pm25^2)+pm25*o3+conf1+conf2+conf3+conf4+conf5+
+               conf1*conf2+I(conf3^2)+conf6, family="poisson", data=regdat)
+  ## for each CF level in matched data, use regression function to predict outcome with true confounders and with confounders of matches ##
+  predXi<-data.frame(Ecf[orig.matchind.1$trtind,],X[orig.matchind.1$trtind,-1],exp(X[orig.matchind.1$trtind,5])/(1+exp(X[orig.matchind.1$trtind,5])))
+  predXj<-data.frame(Ecf[orig.matchind.1$trtind,],X[orig.matchind.1$ctlind,-1],exp(X[orig.matchind.1$ctlind,5])/(1+exp(X[orig.matchind.1$ctlind,5])))
+  names(predXi)<-c('pm25','o3',paste0('conf',1:6))
+  names(predXj)<-c('pm25','o3',paste0('conf',1:6))
+  ## take difference to be used for bias correction ##
+  diffmeans<-predict(fit.1, predXi, type="response")-predict(fit.1, predXj, type="response")
+  ## impute counterfactuals ##
+  EYcf<-tapply(Yobs[orig.matchind.1$ctlind]+diffmeans,orig.matchind.1$trtind,mean)
+  ## difference in imputed counterfactuals and observed number of deaths in each area ## 
+  match.est.3<-sum(EYcf-Yobs[as.numeric(names(EYcf))])
+  
+  ## match.4=correct model for simtype 1 bias correction ##
+  regdat<-data.frame(Yobs,Eobs,X[,-1],exp(X[,5])/(1+exp(X[,5])))
+  names(regdat)<-c('y','pm25','o3',paste0('conf',1:6))
+  fit.1<-glm(y~pm25+o3+I(pm25^2)+pm25*o3+conf1+conf2+conf3+conf4+conf5+
+               pm25*o3*conf5+pm25*o3*conf4+conf1*conf2+I(conf3^2)+conf6, family="poisson", data=regdat)
+  ## for each CF level in matched data, use regression function to predict outcome with true confounders and with confounders of matches ##
+  predXi<-data.frame(Ecf[orig.matchind.1$trtind,],X[orig.matchind.1$trtind,-1],exp(X[orig.matchind.1$trtind,5])/(1+exp(X[orig.matchind.1$trtind,5])))
+  predXj<-data.frame(Ecf[orig.matchind.1$trtind,],X[orig.matchind.1$ctlind,-1],exp(X[orig.matchind.1$ctlind,5])/(1+exp(X[orig.matchind.1$ctlind,5])))
+  names(predXi)<-c('pm25','o3',paste0('conf',1:6))
+  names(predXj)<-c('pm25','o3',paste0('conf',1:6))
+  ## take difference to be used for bias correction ##
+  diffmeans<-predict(fit.1, predXi, type="response")-predict(fit.1, predXj, type="response")
+  ## impute counterfactuals ##
+  EYcf<-tapply(Yobs[orig.matchind.1$ctlind]+diffmeans,orig.matchind.1$trtind,mean)
+  ## difference in imputed counterfactuals and observed number of deaths in each area ## 
+  match.est.4<-sum(EYcf-Yobs[as.numeric(names(EYcf))])
+
+  ######################
+  ## do bootstrapping ##
+  ######################
+    
+  match.1.bootest<-NULL
+  match.2.bootest<-NULL
+  match.3.bootest<-NULL
+  match.4.bootest<-NULL
+  
+  match.boottru<-NULL
+
+  ## initiate a list to save the bootstrapped data ##
+  allboot<-list()
+  for (j in 1:nboot){
+    
+    ## bootstrap from the trimmed sample ##
+    bootind1<-sample(x=keep.1,size=length(keep.1),replace=T)
+    Yobs.TSboot<-Yobs[bootind1]
+    Eobs.TSboot<-Eobs[bootind1,]
+    Ecf.TSboot<-Ecf[bootind1,]
+    X.TSboot<-X[bootind1,-1]
+
+    ## bootstrap from the untrimmed sample ##
+    bootind2<-sample(x=1:N,size=N,replace=T)
+    Yobs.USboot<-Yobs[bootind2]
+    Eobs.USboot<-Eobs[bootind2,]
+    Ecf.USboot<-Ecf[bootind2,]
+    X.USboot<-X[bootind2,-1]
+    
+    ## save the bootstrapped data in the list ##
+    allboot[[j]]<-list(Yobs.TSboot,Eobs.TSboot,Ecf.TSboot,X.TSboot,Yobs.USboot,Eobs.USboot,Ecf.USboot,X.USboot,bootind1,bootind2)
+  }
+    
+
+  ## run the matching on the bootstrapped data as described in Section 3 of the paper ##
+  matchout.1<-lapply(allboot,match_rn_boot5,mdqtl=mean(quan),calpE=xx[1:length(keep.1),])
+    
+  ## resulting indices are in terms of the bootstrapped datasets, correct them so that they point to the index in the original data ##
+  for (j in 1:nboot){
+    matchout.1[[j]]$trtind.orig<-allboot[[j]][[9]][matchout.1[[j]]$trtind]
+    matchout.1[[j]]$ctlind.orig<-allboot[[j]][[10]][matchout.1[[j]]$ctlind]
+  }
+    
+
+  ##########################################################
+  ## compute matching estimates for each bootstrap sample ##
+  ##########################################################
+    
+  for (j in 1:nboot){
+    matchind.1<-matchout.1[[j]]
+    
+    ## match.1 ##
+    EYcf<-tapply(Yobs[matchind.1$ctlind.orig],matchind.1$trtind,mean)
+    
+    unqtrt<-NULL
+    for (k in 1:max(matchind.1$trtind)){
+      unqtrt<-c(unqtrt,matchind.1$trtind.orig[which(matchind.1$trtind==k)][1])
+    }
+    
+    ## difference in imputed counterfactuals and observed number of deaths in each area ## 
+    match.1.bootest<-c(match.1.bootest,sum(EYcf-Yobs[unqtrt]))
+    
+    ## match.2 ##
+    regdat<-data.frame(Yobs[allboot[[j]][[10]]],Eobs[allboot[[j]][[10]],],X[allboot[[j]][[10]],-1])
+    names(regdat)<-c('y','pm25','o3',paste0('conf',1:5))
+    fit.1<-glm(y~pm25+o3+conf1+conf2+conf3+conf4+conf5, family="poisson", data=regdat)
+    ## for each CF level in matched data, use regression function to predict outcome with true confounders and with confounders of matches ##
+    predXi<-data.frame(Ecf[matchind.1$trtind.orig,],X[matchind.1$trtind.orig,-1])
+    predXj<-data.frame(Ecf[matchind.1$trtind.orig,],X[matchind.1$ctlind.orig,-1])
+    names(predXi)<-c('pm25','o3',paste0('conf',1:5))
+    names(predXj)<-c('pm25','o3',paste0('conf',1:5))
+    ## take difference to be used for bias correction ##
+    diffmeans<-predict(fit.1, predXi, type="response")-predict(fit.1, predXj, type="response")
+    ## impute counterfactuals ##
+    EYcf<-tapply(Yobs[matchind.1$ctlind.orig]+diffmeans,matchind.1$trtind,mean)
+    ## difference in imputed counterfactuals and observed number of deaths in each area ## 
+    match.2.bootest<-c(match.2.bootest,sum(EYcf-Yobs[unqtrt]))
+    
+    ## match.3 ##
+    regdat<-data.frame(Yobs[allboot[[j]][[10]]],Eobs[allboot[[j]][[10]],],X[allboot[[j]][[10]],-1],exp(X[allboot[[j]][[10]],5])/(1+exp(X[allboot[[j]][[10]],5])))
+    names(regdat)<-c('y','pm25','o3',paste0('conf',1:6))
+    fit.1<-glm(y~pm25+o3+I(pm25^2)+pm25*o3+conf1+conf2+conf3+conf4+conf5+
+                 conf1*conf2+I(conf3^2)+conf6, family="poisson", data=regdat)
+    ## for each CF level in matched data, use regression function to predict outcome with true confounders and with confounders of matches ##
+    predXi<-data.frame(Ecf[matchind.1$trtind.orig,],X[matchind.1$trtind.orig,-1],exp(X[matchind.1$trtind.orig,5])/(1+exp(X[matchind.1$trtind.orig,5])))
+    predXj<-data.frame(Ecf[matchind.1$trtind.orig,],X[matchind.1$ctlind.orig,-1],exp(X[matchind.1$ctlind.orig,5])/(1+exp(X[matchind.1$ctlind.orig,5])))
+    names(predXi)<-c('pm25','o3',paste0('conf',1:6))
+    names(predXj)<-c('pm25','o3',paste0('conf',1:6))
+    ## take difference to be used for bias correction ##
+    diffmeans<-predict(fit.1, predXi, type="response")-predict(fit.1, predXj, type="response")
+    ## impute counterfactuals ##
+    EYcf<-tapply(Yobs[matchind.1$ctlind.orig]+diffmeans,matchind.1$trtind,mean)
+    ## difference in imputed counterfactuals and observed number of deaths in each area ## 
+    match.3.bootest<-c(match.3.bootest,sum(EYcf-Yobs[unqtrt]))
+    
+    ## match.4 ##
+    regdat<-data.frame(Yobs[allboot[[j]][[10]]],Eobs[allboot[[j]][[10]],],X[allboot[[j]][[10]],-1],exp(X[allboot[[j]][[10]],5])/(1+exp(X[allboot[[j]][[10]],5])))
+    names(regdat)<-c('y','pm25','o3',paste0('conf',1:6))
+    fit.1<-glm(y~pm25+o3+I(pm25^2)+pm25*o3+conf1+conf2+conf3+conf4+conf5+
+                 pm25*o3*conf5+pm25*o3*conf4+conf1*conf2+I(conf3^2)+conf6, family="poisson", data=regdat)
+    ## for each CF level in matched data, use regression function to predict outcome with true confounders and with confounders of matches ##
+    predXi<-data.frame(Ecf[matchind.1$trtind.orig,],X[matchind.1$trtind.orig,-1],exp(X[matchind.1$trtind.orig,5])/(1+exp(X[matchind.1$trtind.orig,5])))
+    predXj<-data.frame(Ecf[matchind.1$trtind.orig,],X[matchind.1$ctlind.orig,-1],exp(X[matchind.1$ctlind.orig,5])/(1+exp(X[matchind.1$ctlind.orig,5])))
+    names(predXi)<-c('pm25','o3',paste0('conf',1:6))
+    names(predXj)<-c('pm25','o3',paste0('conf',1:6))
+    ## take difference to be used for bias correction ##
+    diffmeans<-predict(fit.1, predXi, type="response")-predict(fit.1, predXj, type="response")
+    ## impute counterfactuals ##
+    EYcf<-tapply(Yobs[matchind.1$ctlind.orig]+diffmeans,matchind.1$trtind,mean)
+    ## difference in imputed counterfactuals and observed number of deaths in each area ## 
+    match.4.bootest<-c(match.4.bootest,sum(EYcf-Yobs[unqtrt]))
+    
+    ## save the truth for each bootstrap sample ##
+    match.boottru<-c(match.boottru,sum(ice[allboot[[j]][[9]]]))
+  }
+  matchout.1<-NULL
+  matchind.1<-NULL
+
+  ## save the matching results and print to console ##
+  match.1<-rbind(match.1,c(match.est.1,quantile(match.1.bootest,.025),quantile(match.1.bootest,.975)))
+  match.2<-rbind(match.2,c(match.est.2,quantile(match.2.bootest,.025),quantile(match.2.bootest,.975)))
+  match.3<-rbind(match.3,c(match.est.3,quantile(match.3.bootest,.025),quantile(match.3.bootest,.975)))
+  match.4<-rbind(match.4,c(match.est.4,quantile(match.4.bootest,.025),quantile(match.4.bootest,.975)))
+
+  print(paste0('True TEA: ',sum(ice[keep.1])))
+  print(paste0('Matching with no bias correction: ',match.est.1,' (',quantile(match.1.bootest,.025),',',quantile(match.1.bootest,.975),')'))
+  print(paste0('Matching with linear bias correction: ',match.est.2,' (',quantile(match.2.bootest,.025),',',quantile(match.2.bootest,.975),')'))
+  print(paste0('Matching with correct bias correction for S-1: ',match.est.4,' (',quantile(match.4.bootest,.025),',',quantile(match.4.bootest,.975),')'))
+  print(paste0('Matching with correct bias correction for S-2: ',match.est.3,' (',quantile(match.3.bootest,.025),',',quantile(match.3.bootest,.975),')'))
+  
+  
+  ##########
+  ## BART ##
+  ##########
+  
+  ## fit the BART model to the observed data ##
+  ## use BART to predict counterfactuals ##
+  bartfit<-bart(x.train=cbind(Eobs,X[,-1]),y.train=as.numeric(Yobs),x.test=cbind(Ecf,X[,-1]),verbose = F)
+  
+  ## use BART to estimate the TEA (note that we are only using the units retained after trimming for estimation) ##
+  bartest_tr<-sum(bartfit$yhat.test.mean[keep.1]-Yobs[keep.1])
+  
+  ## compute the credible interval ##
+  tau_pd_tr<-NULL
+  for (j in 1:1000){
+    tau_pd_tr<-c(tau_pd_tr,sum(rnorm(n=length(keep.1),mean=bartfit$yhat.test[j,keep.1],sd=bartfit$sigma[j])-Yobs[keep.1]))
+  }
+  
+  ## save the BART results and print to console ##
+  bart.1<-rbind(bart.1, c(bartest_tr,quantile(tau_pd_tr,c(.025,.975))))
+  print(paste0('BART: ',bartest_tr,' (',quantile(tau_pd_tr,.025),',',quantile(tau_pd_tr,.975),')'))
+  
+  ########################
+  ## Poisson Regression ##
+  ########################
+   
+  ## lm.1=linear terms only ##
+  regdat<-data.frame(Yobs,Eobs,X[,-1])
+  names(regdat)<-c('y','pm25','o3',paste0('conf',1:5))
+  fit.3<-glm(y~pm25+o3+conf1+conf2+conf3+conf4+conf5, family="poisson", data=regdat)
+  ## predict at counterfactual pollution levels for all units ##
+  predXi<-data.frame(Ecf[keep.1,],X[keep.1,-1])
+  names(predXi)<-c('pm25','o3',paste0('conf',1:5))
+  EYcf<-predict(fit.3, predXi, type="response")
+  ice_hat.3<-EYcf-Yobs[keep.1]
+  ## compute var-cov matrix for the predictions so that we can get the variance of the their sum ##
+  vdat<-data.frame(Yobs[keep.1],Ecf[keep.1,],X[keep.1,-1])
+  names(vdat)<-c('y','pm25','o3',paste0('conf',1:5))
+  foo<-model.matrix(y~pm25+o3+conf1+conf2+conf3+conf4+conf5,data=vdat)
+  pred_vcov<-(foo*matrix(rep(EYcf,ncol(foo)),nrow=length(keep.1),ncol=ncol(foo),byrow=F))%*%vcov(fit.3)%*%
+            t(foo*matrix(rep(EYcf,ncol(foo)),nrow=length(keep.1),ncol=ncol(foo),byrow=F))
+  
+  ## save results and print to console ##
+  lm.1<-rbind(lm.1,c(sum(ice_hat.3),
+                           sum(ice_hat.3)-1.96*sqrt(matrix(1,ncol=length(keep.1),nrow=1)%*%pred_vcov%*%matrix(1,ncol=1,nrow=length(keep.1))),
+                           sum(ice_hat.3)+1.96*sqrt(matrix(1,ncol=length(keep.1),nrow=1)%*%pred_vcov%*%matrix(1,ncol=1,nrow=length(keep.1)))))
+  print(paste0('PR with linear terms: ',lm.1[nrow(lm.1),1],' (',lm.1[nrow(lm.1),2],',',lm.1[nrow(lm.1),3],')'))
+  
+  ## lm.2=correct model for simtype 2 ##
+  regdat<-data.frame(Yobs,Eobs,X[,-1],exp(X[,5])/(1+exp(X[,5])))
+  names(regdat)<-c('y','pm25','o3',paste0('conf',1:6))
+  fit.3<-glm(y~pm25+o3+I(pm25^2)+pm25*o3+conf1+conf2+conf3+conf4+conf5+
+               conf1*conf2+I(conf3^2)+conf6, family="poisson", data=regdat)
+  ## predict at counterfactual pollution levels for all units ##
+  predXi<-data.frame(Ecf[keep.1,],X[keep.1,-1],exp(X[keep.1,5])/(1+exp(X[keep.1,5])))
+  names(predXi)<-c('pm25','o3',paste0('conf',1:6))
+  EYcf<-predict(fit.3, predXi, type="response")
+  ice_hat.3<-EYcf-Yobs[keep.1]
+  ## compute var-cov matrix for the predictions so that we can get the variance of the their sum ##
+  vdat<-data.frame(Yobs[keep.1],Ecf[keep.1,],X[keep.1,-1],exp(X[keep.1,5])/(1+exp(X[keep.1,5])))
+  names(vdat)<-c('y','pm25','o3',paste0('conf',1:6))
+  foo<-model.matrix(y~pm25+o3+I(pm25^2)+pm25*o3+conf1+conf2+conf3+conf4+conf5+
+                      conf1*conf2+I(conf3^2)+conf6,data=vdat)
+  pred_vcov<-(foo*matrix(rep(EYcf,ncol(foo)),nrow=length(keep.1),ncol=ncol(foo),byrow=F))%*%vcov(fit.3)%*%
+    t(foo*matrix(rep(EYcf,ncol(foo)),nrow=length(keep.1),ncol=ncol(foo),byrow=F))
+  
+  ## save results and print to console ##
+  lm.2<-rbind(lm.2,c(sum(ice_hat.3),
+                     sum(ice_hat.3)-1.96*sqrt(matrix(1,ncol=length(keep.1),nrow=1)%*%pred_vcov%*%matrix(1,ncol=1,nrow=length(keep.1))),
+                     sum(ice_hat.3)+1.96*sqrt(matrix(1,ncol=length(keep.1),nrow=1)%*%pred_vcov%*%matrix(1,ncol=1,nrow=length(keep.1)))))
+  print(paste0('PR correctly specified for S-2: ',lm.2[nrow(lm.2),1],' (',lm.2[nrow(lm.2),2],',',lm.2[nrow(lm.2),3],')'))
+
+  ## lm.3=correct model for simtype 1 ##
+  regdat<-data.frame(Yobs,Eobs,X[,-1],exp(X[,5])/(1+exp(X[,5])))
+  names(regdat)<-c('y','pm25','o3',paste0('conf',1:6))
+  fit.3<-glm(y~pm25+o3+I(pm25^2)+pm25*o3+conf1+conf2+conf3+conf4+conf5+
+               pm25*o3*conf5+pm25*o3*conf4+conf1*conf2+I(conf3^2)+conf6, family="poisson", data=regdat)
+  ## predict at counterfactual pollution levels for all units ##
+  predXi<-data.frame(Ecf[keep.1,],X[keep.1,-1],exp(X[keep.1,5])/(1+exp(X[keep.1,5])))
+  names(predXi)<-c('pm25','o3',paste0('conf',1:6))
+  EYcf<-predict(fit.3, predXi, type="response")
+  ice_hat.3<-EYcf-Yobs[keep.1]
+  ## compute var-cov matrix for the predictions so that we can get the variance of the their sum ##
+  vdat<-data.frame(Yobs[keep.1],Ecf[keep.1,],X[keep.1,-1],exp(X[keep.1,5])/(1+exp(X[keep.1,5])))
+  names(vdat)<-c('y','pm25','o3',paste0('conf',1:6))
+  foo<-model.matrix(y~pm25+o3+I(pm25^2)+pm25*o3+conf1+conf2+conf3+conf4+conf5+
+                      pm25*o3*conf5+pm25*o3*conf4+conf1*conf2+I(conf3^2)+conf6,data=vdat)
+  pred_vcov<-(foo*matrix(rep(EYcf,ncol(foo)),nrow=length(keep.1),ncol=ncol(foo),byrow=F))%*%vcov(fit.3)%*%
+    t(foo*matrix(rep(EYcf,ncol(foo)),nrow=length(keep.1),ncol=ncol(foo),byrow=F))
+  
+  ## save results and print to console ##
+  lm.3<-rbind(lm.3,c(sum(ice_hat.3),
+                     sum(ice_hat.3)-1.96*sqrt(matrix(1,ncol=length(keep.1),nrow=1)%*%pred_vcov%*%matrix(1,ncol=1,nrow=length(keep.1))),
+                     sum(ice_hat.3)+1.96*sqrt(matrix(1,ncol=length(keep.1),nrow=1)%*%pred_vcov%*%matrix(1,ncol=1,nrow=length(keep.1)))))
+  print(paste0('PR correctly specified for S-1: ',lm.3[nrow(lm.3),1],' (',lm.3[nrow(lm.3),2],',',lm.3[nrow(lm.3),3],')'))
+
+  ## true TEA for only units retained after trimming ##
+  trueTEAretain<-c(trueTEAretain,sum(ice[keep.1]))
+
+}
+
+## if desired, use the code below to save the results to an external .RData file ##
+
+match.1<-data.frame('Match 1',match.1)
+match.2<-data.frame('Match 2',match.2)
+match.3<-data.frame('Match 3',match.3)
+match.4<-data.frame('Match 4',match.4)
+
+bart.1<-data.frame('BART',bart.1)
+
+lm.1<-data.frame('PR 1',lm.1)
+lm.2<-data.frame('PR 2',lm.2)
+lm.3<-data.frame('PR 3',lm.3)
+
+names(match.1)<-names(match.2)<-names(match.3)<-names(match.4)<-c('method','est','ll','ul')
+
+names(bart.1)<-c('method','est','ll','ul')
+
+names(lm.1)<-names(lm.2)<-names(lm.3)<-c('method','est','ll','ul')
+
+save(trueTEAall,trueTEAretain,match.1,match.2,match.3,match.4,bart.1,lm.1,lm.2,lm.3,
+     file=paste0('sim',simtype,'_tol',calp*100,'_results.RData'))
+
