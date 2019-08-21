@@ -18,7 +18,7 @@ sdsuntrim<-round(apply(adat[keep.1,],2,sd),2)
 tab1<-data.frame(paste0(meansall,' (',sdsall,')'),paste0(meanstrim,' (',sdstrim,')'),paste0(meansuntrim,' (',sdsuntrim,')'))
 rownames(tab1)<-names(adat)
 names(tab1)<-c('Original Sample','Discarded Units','Trimmed Sample')
-sink('table_3.txt')
+sink('table_2.txt')
 print(tab1)
 sink()
 

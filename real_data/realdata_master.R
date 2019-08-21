@@ -15,10 +15,10 @@ source('analysis_wholeUS.R')
 
 rm(list=ls())
 
-## make table 3, export to file 'table_3.txt' ##
-source('table_3.R')
+## make table 2, export to file 'table_2.txt' ##
+source('table_2.R')
 
 rm(list=ls())
 
-## make figure 3, export to file 'figure_3.pdf' ##
-source('figure_3.R')
+## make figure 2, export to file 'figure_2.pdf' ##
+source('figure_2.R')

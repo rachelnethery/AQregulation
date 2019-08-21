@@ -51,6 +51,6 @@ plot_results<-ggplot(all_results,aes(x=Method,y=allest,colour=Method))+
         text=element_text(size=18))+
   facet_grid(rows=vars(disease),cols=vars(yr))
 
-pdf('figure_3.pdf')
+pdf('figure_2.pdf')
 print(plot_results)
 dev.off()
